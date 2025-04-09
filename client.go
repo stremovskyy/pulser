@@ -329,7 +329,7 @@ func (c *client) sendBatch(ctx context.Context, events []Event) error {
 		return fmt.Errorf("failed to marshal batch: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL+"/batch", bytes.NewBuffer(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL, bytes.NewBuffer(payload))
 	if err != nil {
 		return fmt.Errorf("failed to create batch request: %w", err)
 	}
