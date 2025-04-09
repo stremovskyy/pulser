@@ -27,6 +27,11 @@ type Config struct {
 	AsyncEnabled      bool
 	QueueSize         int
 	DisableKeepAlives bool
+
+	// batch opts
+	BatchEnabled  bool
+	BatchSize     int
+	BatchInterval time.Duration
 }
 
 type Event struct {
@@ -47,6 +52,10 @@ type client struct {
 	cancelFunc  context.CancelFunc
 	initialized bool
 	mu          sync.Mutex
+
+	// batch related
+	batchQueue chan Event
+	batchTimer *time.Timer
 }
 
 type errResponse struct {
@@ -65,6 +74,9 @@ func DefaultConfig() Config {
 		AsyncEnabled:      false,
 		QueueSize:         1000,
 		DisableKeepAlives: false,
+		BatchEnabled:      false,
+		BatchSize:         100,
+		BatchInterval:     5 * time.Second,
 	}
 }
 
@@ -94,6 +106,12 @@ func NewClient(config Config) (Client, error) {
 	if config.QueueSize == 0 {
 		config.QueueSize = DefaultConfig().QueueSize
 	}
+	if config.BatchSize == 0 {
+		config.BatchSize = DefaultConfig().BatchSize
+	}
+	if config.BatchInterval == 0 {
+		config.BatchInterval = DefaultConfig().BatchInterval
+	}
 
 	_, err := url.Parse(config.APIURL)
 	if err != nil {
@@ -122,6 +140,11 @@ func NewClient(config Config) (Client, error) {
 		client.startWorker()
 	}
 
+	if config.BatchEnabled {
+		client.batchQueue = make(chan Event, config.QueueSize)
+		client.startBatchWorker()
+	}
+
 	return client, nil
 }
 
@@ -134,6 +157,7 @@ func (c *client) log(format string, args ...interface{}) {
 func (c *client) Track(ctx context.Context, userID string, eventType EventType, eventSubType EventSubType, metadata map[string]interface{}) error {
 	return c.TrackWithServiceCode(ctx, c.config.ServiceCode, userID, eventType, eventSubType, metadata)
 }
+
 func (c *client) TrackWithServiceCode(ctx context.Context, serviceCode, userID string, eventType EventType, eventSubType EventSubType, metadata map[string]interface{}) error {
 	if !c.initialized {
 		return errors.New("client not properly initialized")
@@ -145,6 +169,16 @@ func (c *client) TrackWithServiceCode(ctx context.Context, serviceCode, userID s
 		EventType:    eventType,
 		EventSubType: eventSubType,
 		Metadata:     metadata,
+	}
+
+	if c.config.BatchEnabled {
+		select {
+		case c.batchQueue <- event:
+			return nil
+		default:
+			c.log("Batch queue full, dropping event: %+v", event)
+			return errors.New("batch queue full, event dropped")
+		}
 	}
 
 	if c.config.AsyncEnabled {
@@ -250,6 +284,113 @@ func (c *client) startWorker() {
 	}()
 }
 
+func (c *client) startBatchWorker() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+
+		batch := make([]Event, 0, c.config.BatchSize)
+		c.batchTimer = time.NewTimer(c.config.BatchInterval)
+
+		for {
+			select {
+			case <-c.ctx.Done():
+				// Send remaining events in batch
+				if len(batch) > 0 {
+					if err := c.sendBatch(c.ctx, batch); err != nil {
+						c.log("Error sending final batch: %v", err)
+					}
+				}
+				return
+			case event := <-c.batchQueue:
+				batch = append(batch, event)
+				if len(batch) >= c.config.BatchSize {
+					if err := c.sendBatch(c.ctx, batch); err != nil {
+						c.log("Error sending batch: %v", err)
+					}
+					batch = batch[:0]
+				}
+			case <-c.batchTimer.C:
+				if len(batch) > 0 {
+					if err := c.sendBatch(c.ctx, batch); err != nil {
+						c.log("Error sending batch: %v", err)
+					}
+					batch = batch[:0]
+				}
+				c.batchTimer.Reset(c.config.BatchInterval)
+			}
+		}
+	}()
+}
+
+func (c *client) sendBatch(ctx context.Context, events []Event) error {
+	payload, err := json.Marshal(events)
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.config.APIURL+"/batch", bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("failed to create batch request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("X-API-KEY", c.config.APIKey)
+
+	c.log("Sending batch of %d events", len(events))
+
+	var lastErr error
+	for retries := 0; retries <= c.config.MaxRetries; retries++ {
+		if retries > 0 {
+			waitTime := c.config.RetryWaitTime * time.Duration(1<<uint(retries-1))
+			if waitTime > c.config.RetryMaxWaitTime {
+				waitTime = c.config.RetryMaxWaitTime
+			}
+
+			c.log("Retrying batch request after %v (attempt %d/%d)", waitTime, retries, c.config.MaxRetries)
+
+			select {
+			case <-time.After(waitTime):
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during retry wait: %w", ctx.Err())
+			}
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("batch request failed: %w", err)
+			c.log("Batch request error: %v", err)
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			c.log("Batch sent successfully")
+			return nil
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+
+		var errResp errResponse
+		if err := json.Unmarshal(respBody, &errResp); err == nil && errResp.Message != "" {
+			lastErr = fmt.Errorf("API error (%d): %s (code: %s)", resp.StatusCode, errResp.Message, errResp.Code)
+		} else {
+			lastErr = fmt.Errorf("API error (%d): %s", resp.StatusCode, string(respBody))
+		}
+
+		c.log("API error: %v", lastErr)
+
+		if resp.StatusCode == http.StatusUnauthorized ||
+			resp.StatusCode == http.StatusForbidden ||
+			resp.StatusCode == http.StatusNotFound {
+			return lastErr
+		}
+	}
+
+	return fmt.Errorf("failed after %d retries: %w", c.config.MaxRetries, lastErr)
+}
+
 func (c *client) Shutdown(timeout time.Duration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -258,7 +399,11 @@ func (c *client) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 
-	if !c.config.AsyncEnabled || c.queue == nil {
+	if c.batchTimer != nil {
+		c.batchTimer.Stop()
+	}
+
+	if !c.config.AsyncEnabled && !c.config.BatchEnabled {
 		c.cancelFunc()
 		return nil
 	}
